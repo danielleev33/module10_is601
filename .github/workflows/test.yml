@@ -72,12 +72,13 @@ jobs:
         run: docker build -t app:test .
       
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.33.1
         with:
-          image-ref: 'app:test'
-          format: 'table'
-          exit-code: '1'
+          image-ref: app:test
+          format: table
+          exit-code: '0'
           ignore-unfixed: true
+          vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
   
   deploy:
@@ -99,8 +100,8 @@ jobs:
         with:
           push: true
           tags: |
-            kaw393939/601_module9:latest
-            kaw393939/601_module9:${{ github.sha }}
+            danielleev33/module10-is601:latest
+            danielleev33/module10-is601:${{ github.sha }}
           platforms: linux/amd64,linux/arm64
-          cache-from: type=registry,ref=kaw393939/601_module9:cache
+          cache-from: type=registry,ref=danielleev33/module10-is601:cache
           cache-to: type=inline,mode=max

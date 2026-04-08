@@ -1,30 +1,32 @@
 # tests/conftest.py
 
+import logging
+import socket
 import subprocess
 import time
-import logging
-from typing import Generator, Dict, List
 from contextlib import contextmanager
+from threading import Thread
+from typing import Dict, Generator, List
 
 import pytest
 import requests
+import uvicorn
 from faker import Faker
-from playwright.sync_api import sync_playwright, Browser, Page
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from playwright.sync_api import Browser, Page, sync_playwright
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
-from app.database import Base, get_engine, get_sessionmaker
-from app.models.user import User
 from app.config import settings
+from app.database import Base, get_engine, get_sessionmaker
 from app.database_init import init_db, drop_db
+from app.models.user import User
 
 # ======================================================================================
 # Logging Configuration
 # ======================================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -53,10 +55,11 @@ def create_fake_user() -> Dict[str, str]:
     return {
         "first_name": fake.first_name(),
         "last_name": fake.last_name(),
-        "email": fake.unique.email(),  # Ensure uniqueness where necessary
+        "email": fake.unique.email(),
         "username": fake.unique.user_name(),
-        "password": fake.password(length=12)
+        "password": fake.password(length=12),
     }
+
 
 @contextmanager
 def managed_db_session():
@@ -78,27 +81,40 @@ def managed_db_session():
     finally:
         session.close()
 
+
+def port_in_use(host: str, port: int) -> bool:
+    """
+    Check whether a TCP port is already in use.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
 # ======================================================================================
 # Server Startup / Healthcheck
 # ======================================================================================
 def wait_for_server(url: str, timeout: int = 30) -> bool:
     """
-    Wait for server to be ready, raising an error if it never becomes available.
+    Wait for server to be ready.
+
+    Uses GET and accepts any non-5xx response as proof the server is alive.
     """
     start_time = time.time()
     while (time.time() - start_time) < timeout:
         try:
-            response = requests.get(url)
-            if response.status_code == 200:
+            response = requests.get(url, timeout=1)
+            if response.status_code < 500:
                 return True
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException:
             pass
-        time.sleep(1)
+        time.sleep(0.5)
     return False
 
+
 class ServerStartupError(Exception):
-    """Raised when the test server fails to start properly"""
-    pass
+    """Raised when the test server fails to start properly."""
+
 
 # ======================================================================================
 # Primary Database Fixtures
@@ -136,6 +152,7 @@ def setup_test_database(request):
         drop_db()
         logger.info("Dropped test database tables.")
 
+
 @pytest.fixture
 def db_session(request) -> Generator[Session, None, None]:
     """
@@ -160,6 +177,7 @@ def db_session(request) -> Generator[Session, None, None]:
         session.close()
         logger.info("db_session teardown: done.")
 
+
 # ======================================================================================
 # Test Data Fixtures
 # ======================================================================================
@@ -167,6 +185,7 @@ def db_session(request) -> Generator[Session, None, None]:
 def fake_user_data() -> Dict[str, str]:
     """Provide a dictionary of fake user data."""
     return create_fake_user()
+
 
 @pytest.fixture
 def test_user(db_session: Session) -> User:
@@ -180,6 +199,7 @@ def test_user(db_session: Session) -> User:
     db_session.refresh(user)
     logger.info(f"Created test user with ID: {user.id}")
     return user
+
 
 @pytest.fixture
 def seed_users(db_session: Session, request) -> List[User]:
@@ -207,44 +227,58 @@ def seed_users(db_session: Session, request) -> List[User]:
     logger.info(f"Seeded {len(users)} users into the test database.")
     return users
 
+
 # ======================================================================================
-# FastAPI Server Fixture (Optional)
+# FastAPI Server Fixture (Fixed)
 # ======================================================================================
 @pytest.fixture(scope="session")
 def fastapi_server():
     """
-    Start and manage a FastAPI test server, if needed for integration tests.
+    Start and manage a FastAPI test server for e2e tests.
+
+    Uses a background Uvicorn thread instead of subprocess.Popen,
+    which is more reliable in this WSL/pytest setup.
     """
-    server_url = 'http://127.0.0.1:8000/'
+    from main import app
+
+    server_url = "http://127.0.0.1:8000/"
     logger.info("Starting test server...")
 
-    try:
-        process = subprocess.Popen(
-            ['python', 'main.py'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        if not wait_for_server(server_url, timeout=30):
-            raise ServerStartupError("Failed to start test server")
+    # Kill stale local server processes that may already be holding port 8000
+    subprocess.run(["pkill", "-f", "python main.py"], check=False)
+    subprocess.run(["pkill", "-f", "uvicorn"], check=False)
+    time.sleep(1)
 
-        logger.info("Test server started successfully.")
-        yield  # Run all tests that depend on this fixture
+    if port_in_use("127.0.0.1", 8000):
+        raise ServerStartupError("Port 8000 is already in use before test server startup.")
 
-    except Exception as e:
-        logger.error(f"Server error: {str(e)}")
-        raise
-    finally:
-        logger.info("Terminating test server...")
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-            logger.info("Test server terminated gracefully.")
-        except subprocess.TimeoutExpired:
-            logger.warning("Test server did not terminate in time; killing it.")
-            process.kill()
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=8000,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+
+    thread = Thread(target=server.run, daemon=True)
+    thread.start()
+
+    if not wait_for_server(server_url, timeout=30):
+        raise ServerStartupError("Failed to start test server.")
+
+    logger.info("Test server started successfully.")
+    yield
+
+    logger.info("Terminating test server...")
+    server.should_exit = True
+    thread.join(timeout=5)
+
+    if thread.is_alive():
+        logger.warning("Test server thread did not terminate in time.")
+
 
 # ======================================================================================
-# Browser and Page Fixtures (Optional)
+# Browser and Page Fixtures
 # ======================================================================================
 @pytest.fixture(scope="session")
 def browser_context():
@@ -254,7 +288,7 @@ def browser_context():
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage']
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
         logger.info("Playwright browser launched.")
         try:
@@ -263,13 +297,15 @@ def browser_context():
             logger.info("Closing Playwright browser.")
             browser.close()
 
+
 @pytest.fixture
-def page(browser_context: Browser):
+def page(browser_context: Browser, fastapi_server) -> Generator[Page, None, None]:
     """
     Provide a new browser page for each test.
+    Depends on fastapi_server so the server is guaranteed to be up first.
     """
     context = browser_context.new_context(
-        viewport={'width': 1920, 'height': 1080},
+        viewport={"width": 1920, "height": 1080},
         ignore_https_errors=True
     )
     page = context.new_page()
@@ -280,6 +316,7 @@ def page(browser_context: Browser):
         logger.info("Closing browser page and context.")
         page.close()
         context.close()
+
 
 # ======================================================================================
 # Pytest Command-Line Options and Test Collection
@@ -301,6 +338,7 @@ def pytest_addoption(parser):
         help="Run tests marked as slow"
     )
 
+
 def pytest_collection_modifyitems(config, items):
     """
     Automatically skip slow tests unless --run-slow is specified.
@@ -310,6 +348,7 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "slow" in item.keywords:
                 item.add_marker(skip_slow)
+
 
 # ======================================================================================
 # How to Use This File
@@ -334,7 +373,7 @@ Basic Examples:
        # test logic...
 
 4. Testing with multiple users:
-   @pytest.mark.parametrize('seed_users', [10], indirect=True)
+   @pytest.mark.parametrize("seed_users", [10], indirect=True)
    def test_user_list(seed_users):
        # seed_users contains 10 test users
        assert len(seed_users) == 10
