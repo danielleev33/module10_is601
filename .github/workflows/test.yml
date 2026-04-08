@@ -79,7 +79,7 @@ jobs:
           exit-code: '0'
           ignore-unfixed: true
           vuln-type: 'os,library'
-          severity: 'CRITICAL'
+          severity: 'CRITICAL,HIGH'
   
   deploy:
     needs: security
@@ -98,7 +98,9 @@ jobs:
           
       - uses: docker/build-push-action@v5
         with:
+          context: .
           push: true
+          load: true
           tags: |
             danielleev33/module10-is601:latest
             danielleev33/module10-is601:${{ github.sha }}
