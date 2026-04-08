@@ -74,7 +74,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.35.0
         with:
-          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/module10-is601:latest
+          image-ref: danielleev33/module10-is601:latest
           format: table
           exit-code: '0'
           ignore-unfixed: true
